@@ -1,0 +1,744 @@
+name: Kerlov release
+
+# Rebuilds every upstream (pingdotgg/t3code) nightly and stable release tag with
+# this branch's patch stack applied, at the same version and under the same tag,
+# and publishes it here so installs auto-update from this repository. It never
+# builds this repository's own commits. Lives only on the patch branch, which
+# must be the default branch for the schedule to run.
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to build (for example v0.1.12-nightly.20261122.5098). Empty picks the next unreleased one."
+        required: false
+        type: string
+
+run-name: Kerlov release ${{ inputs.tag || '(next upstream tag)' }}
+
+# One release at a time, never canceled, every pending run kept.
+concurrency:
+  group: kerlov-release
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  # The Windows desktop jobs read this run's artifact list (see release-desktop.yml).
+  actions: read
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+
+jobs:
+  resolve:
+    name: Resolve upstream tag
+    if: github.repository == 'codityhq/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      channel: ${{ steps.resolve.outputs.channel }}
+      name: ${{ steps.resolve.outputs.name }}
+      mac: ${{ steps.mac.outputs.enabled }}
+    steps:
+      # macOS builds that cannot be signed could never auto-update, so they are not shipped.
+      - id: mac
+        name: Check macOS signing
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+        run: |
+          if [[ -n "$CSC_LINK" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CSC_LINK is not set, so this run builds no macOS artifacts."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: resolve
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        with:
+          retries: 3
+          script: |
+            const [upOwner, upRepo] = process.env.UPSTREAM_REPOSITORY.split('/');
+            const NIGHTLY = /^v(\d+)\.(\d+)\.(\d+)-nightly\.(\d{8})\.(\d+)$/;
+            const STABLE = /^v(\d+)\.(\d+)\.(\d+)$/;
+            const query = `query ($owner: String!, $repo: String!) {
+              repository(owner: $owner, name: $repo) {
+                releases(first: 100, orderBy: { field: CREATED_AT, direction: DESC }) {
+                  nodes { tagName name isDraft isPrerelease publishedAt }
+                }
+              }
+            }`;
+            const list = async (owner, repo) =>
+              (await github.graphql(query, { owner, repo })).repository.releases.nodes;
+            const key = (tag) => {
+              const m = NIGHTLY.exec(tag) ?? STABLE.exec(tag);
+              return m.slice(1).map(Number);
+            };
+            const compare = (a, b) => {
+              const [x, y] = [key(a), key(b)];
+              for (let i = 0; i < Math.max(x.length, y.length); i++) {
+                const d = (x[i] ?? 0) - (y[i] ?? 0);
+                if (d !== 0) return d;
+              }
+              return 0;
+            };
+            const newest = (tags) => tags.toSorted(compare).at(-1);
+
+            const upstream = (await list(upOwner, upRepo)).filter((r) => !r.isDraft && r.publishedAt);
+            const ours = (await list(context.repo.owner, context.repo.repo)).filter((r) => !r.isDraft);
+            const published = new Set(ours.map((r) => r.tagName));
+            const ourNightly = newest(ours.map((r) => r.tagName).filter((t) => NIGHTLY.test(t)));
+            const ourStable = newest(ours.map((r) => r.tagName).filter((t) => STABLE.test(t)));
+
+            const blocked = async (tag) => {
+              const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "Kerlov release blocked: ${tag}"`;
+              try {
+                const { data } = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
+                return data.total_count > 0;
+              } catch (error) {
+                core.warning(`Could not search for blocking issues: ${error.message}`);
+                return false;
+              }
+            };
+
+            let release;
+            const requested = process.env.REQUESTED_TAG?.trim();
+            if (requested) {
+              if (!NIGHTLY.test(requested) && !STABLE.test(requested)) {
+                throw new Error(`${requested} is not an upstream nightly or stable tag.`);
+              }
+              const { data } = await github.rest.repos.getReleaseByTag({ owner: upOwner, repo: upRepo, tag: requested });
+              if (data.draft) throw new Error(`${requested} is a draft upstream.`);
+              if (published.has(requested)) throw new Error(`${requested} is already released here.`);
+              // The update-feed pointer follows the newest published nightly, so never publish an older one.
+              if (NIGHTLY.test(requested) && ourNightly && compare(requested, ourNightly) < 0) {
+                throw new Error(`${requested} is older than ${ourNightly}, which is already released here.`);
+              }
+              release = { tagName: data.tag_name, name: data.name };
+            } else {
+              const stables = upstream
+                .filter((r) => !r.isPrerelease && STABLE.test(r.tagName))
+                .toSorted((a, b) => compare(a.tagName, b.tagName));
+              // Before the first stable here, only stables upstream published after this
+              // repository's first release; older ones predate the patch. Dispatch builds them.
+              const firstRelease = ours.map((r) => Date.parse(r.publishedAt)).toSorted().at(0);
+              const stableCandidates = ourStable
+                ? stables.filter((r) => compare(r.tagName, ourStable) > 0)
+                : firstRelease === undefined
+                  ? stables.slice(-1)
+                  : stables.filter((r) => Date.parse(r.publishedAt) > firstRelease);
+              const nightly = upstream
+                .filter((r) => NIGHTLY.test(r.tagName))
+                .toSorted((a, b) => compare(a.tagName, b.tagName))
+                .at(-1);
+              const nightlyCandidates =
+                nightly && (!ourNightly || compare(nightly.tagName, ourNightly) > 0) ? [nightly] : [];
+              for (const candidate of [...stableCandidates, ...nightlyCandidates]) {
+                if (published.has(candidate.tagName)) continue;
+                if (await blocked(candidate.tagName)) {
+                  core.warning(`Skipping ${candidate.tagName}: an open "Kerlov release blocked" issue names it. Close it to retry.`);
+                  continue;
+                }
+                release = candidate;
+                break;
+              }
+            }
+
+            if (!release) {
+              core.info('Nothing to build: every candidate upstream tag is released here.');
+              return;
+            }
+            const channel = NIGHTLY.test(release.tagName) ? 'nightly' : 'stable';
+            core.notice(`Building ${release.tagName} (${channel}).`);
+            core.setOutput('tag', release.tagName);
+            core.setOutput('version', release.tagName.slice(1));
+            core.setOutput('channel', channel);
+            core.setOutput('name', release.name || `T3 Code ${release.tagName}`);
+
+  # Applies the patch stack (this branch's commits since it left upstream main)
+  # to the upstream tag and pushes the result under the same tag name.
+  prepare:
+    name: Apply patch to ${{ needs.resolve.outputs.tag }}
+    needs: [resolve]
+    if: needs.resolve.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      ref: ${{ steps.push.outputs.ref }}
+      conflict: ${{ steps.apply.outputs.conflict }}
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      PATCH_HEAD: ${{ github.sha }}
+    steps:
+      - name: Fetch upstream tag and patch branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch -q --no-tags upstream "+refs/heads/main:refs/remotes/upstream/main" "+refs/tags/$TAG:refs/upstream-tags/$TAG"
+          git fetch -q --no-tags origin "+$PATCH_HEAD:refs/remotes/origin/patch"
+          # Earlier release tags here let the push skip history they already hold.
+          git fetch -q origin "+refs/tags/*:refs/tags/*" || true
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c advice.detachedHead=false checkout -q --detach "refs/upstream-tags/$TAG^{commit}"
+
+      - id: apply
+        name: Cherry-pick the patch stack
+        run: |
+          set -euo pipefail
+          base="$(git merge-base refs/remotes/origin/patch refs/remotes/upstream/main)"
+          mapfile -t commits < <(git rev-list --reverse --no-merges "$base..refs/remotes/origin/patch")
+          echo "Patch stack (${#commits[@]} commits on ${base:0:12}):"
+          git log --oneline --reverse "$base..refs/remotes/origin/patch"
+          for commit in "${commits[@]}"; do
+            if git cherry-pick "$commit" > /dev/null; then continue; fi
+            unmerged="$(git diff --name-only --diff-filter=U)"
+            # The lockfile is regenerated below, so its conflicts are not real ones.
+            if [[ "$unmerged" == "pnpm-lock.yaml" ]]; then
+              git checkout --ours pnpm-lock.yaml
+              git add pnpm-lock.yaml
+              git -c core.editor=true cherry-pick --continue
+              continue
+            fi
+            summary="$(git log -1 --format='%h %s' "$commit"): $(echo $unmerged)"
+            echo "conflict=$summary" >> "$GITHUB_OUTPUT"
+            echo "::error::Patch does not apply to $TAG. $summary"
+            git cherry-pick --abort
+            exit 1
+          done
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install: "false"
+
+      - name: Regenerate the lockfile
+        run: |
+          set -euo pipefail
+          vp install --lockfile-only --no-frozen-lockfile
+          if ! git diff --quiet -- pnpm-lock.yaml; then
+            git commit -q -m "chore: update pnpm-lock.yaml for the Kerlov patch on $TAG" -- pnpm-lock.yaml
+          fi
+          git log --oneline -n 12
+
+      # GITHUB_TOKEN may not push commits that change workflow files, which the
+      # upstream history and this patch both do. When GitHub refuses, the tag
+      # gets one commit on the patch branch instead: the patched tree with this
+      # branch's workflows, which the build reads from this branch anyway.
+      - id: push
+        name: Push the tag
+        run: |
+          set -euo pipefail
+          patched="$(git rev-parse HEAD)"
+          git tag -f "$TAG" "$patched"
+          if git push -f origin "refs/tags/$TAG" 2> push.log; then
+            echo "ref=$patched" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cat push.log
+          grep -q "workflow" push.log || exit 1
+          echo "::notice::Push refused for workflow changes; tagging a single commit on the patch branch."
+          export GIT_INDEX_FILE="$RUNNER_TEMP/graft-index"
+          git read-tree "$patched"
+          git rm -r -q --cached .github/workflows
+          git read-tree --prefix=.github/workflows/ "refs/remotes/origin/patch:.github/workflows"
+          tree="$(git write-tree)"
+          unset GIT_INDEX_FILE
+          upstream_sha="$(git rev-parse "refs/upstream-tags/$TAG^{commit}")"
+          graft="$(git commit-tree "$tree" -p refs/remotes/origin/patch \
+            -m "release: $TAG with the Kerlov patch" \
+            -m "Upstream $UPSTREAM_REPOSITORY@$upstream_sha plus the patch stack, as built at $patched. Workflow files are this branch's.")"
+          git tag -f "$TAG" "$graft"
+          git push -f origin "refs/tags/$TAG"
+          echo "ref=$graft" >> "$GITHUB_OUTPUT"
+
+  checks:
+    name: Patch checks
+    needs: [resolve, prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+
+      - name: Typecheck patched packages
+        run: vp run --filter @t3tools/source-control-kerlov --filter @t3tools/shared --filter @t3tools/client-runtime --filter t3 --filter @t3tools/web typecheck
+
+      - name: Test the Kerlov provider
+        run: vp run --filter @t3tools/source-control-kerlov test
+
+  # Same as release.yml's build_bundle, without the pingdotgg-only relay
+  # tracing config and npm launcher.
+  bundle:
+    name: Build JS bundle
+    needs: [resolve, prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Require T3 Connect config
+        run: |
+          for name in T3CODE_CLERK_PUBLISHABLE_KEY T3CODE_CLERK_JWT_TEMPLATE T3CODE_CLERK_CLI_OAUTH_CLIENT_ID T3CODE_RELAY_URL; do
+            if [[ -z "${!name}" ]]; then echo "::error::Repository variable $name is not set."; exit 1; fi
+          done
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.resolve.outputs.version }}"
+
+      - name: Build JS bundle
+        env:
+          # Builds outside pingdotgg/t3code report "dev" telemetry, as upstream's own workflows do.
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: vp run build:desktop:bundle
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  desktop_mac_arm64:
+    name: Desktop macOS arm64
+    needs: [resolve, prepare, bundle]
+    if: needs.resolve.outputs.mac == 'true'
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: ${{ needs.resolve.outputs.channel }}
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.T3CODE_RELAY_URL }}
+      label: macOS arm64
+      runner: macos-15
+      platform: mac
+      target: dmg
+      arch: arm64
+      rust_target: aarch64-apple-darwin
+      resource_key: darwin-arm64
+      cli_archive: true
+      launch_check: true
+      save_pnpm_store: false
+
+  desktop_mac_x64:
+    name: Desktop macOS x64
+    needs: [resolve, prepare, bundle]
+    if: needs.resolve.outputs.mac == 'true'
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: ${{ needs.resolve.outputs.channel }}
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.T3CODE_RELAY_URL }}
+      label: macOS x64
+      runner: macos-15-intel
+      platform: mac
+      target: dmg
+      arch: x64
+      rust_target: x86_64-apple-darwin
+      resource_key: darwin-x64
+      cli_archive: false
+
+  # The Windows jobs wait for a job named "Build Linux <arch>", so keep these labels.
+  desktop_linux_x64:
+    name: Desktop Linux x64
+    needs: [resolve, prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: ${{ needs.resolve.outputs.channel }}
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.T3CODE_RELAY_URL }}
+      label: Linux x64
+      runner: ubuntu-24.04
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+      launch_check: true
+
+  desktop_linux_arm64:
+    name: Desktop Linux arm64
+    needs: [resolve, prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: ${{ needs.resolve.outputs.channel }}
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.T3CODE_RELAY_URL }}
+      label: Linux arm64
+      runner: ubuntu-24.04-arm
+      platform: linux
+      target: AppImage
+      arch: arm64
+      rust_target: aarch64-unknown-linux-gnu
+      resource_key: linux-arm64
+      cli_archive: true
+
+  # Without Azure Trusted Signing secrets these ship unsigned, and their
+  # app-update.yml carries no publisherName, so the updater skips the check.
+  desktop_win_x64:
+    name: Desktop Windows x64
+    needs: [resolve, prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: ${{ needs.resolve.outputs.channel }}
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.T3CODE_RELAY_URL }}
+      label: Windows x64
+      runner: ubuntu-24.04
+      verify_runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: true
+
+  desktop_win_arm64:
+    name: Desktop Windows arm64
+    needs: [resolve, prepare, bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: ${{ needs.resolve.outputs.channel }}
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.T3CODE_RELAY_URL }}
+      label: Windows arm64
+      runner: ubuntu-24.04
+      verify_runner: windows-11-arm
+      platform: win
+      target: nsis
+      arch: arm64
+      rust_target: aarch64-pc-windows-msvc
+      resource_key: win32-arm64
+      cli_archive: true
+
+  # Uploads to a draft and publishes only once every asset is attached, so a
+  # version in the update feed always has its CLI archives (see release.md,
+  # "Server self-update release invariant").
+  publish:
+    name: Publish GitHub Release
+    needs:
+      [
+        resolve,
+        prepare,
+        checks,
+        desktop_mac_arm64,
+        desktop_mac_x64,
+        desktop_linux_x64,
+        desktop_linux_arm64,
+        desktop_win_x64,
+        desktop_win_arm64,
+      ]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' && needs.checks.result == 'success' &&
+      needs.desktop_linux_x64.result == 'success' && needs.desktop_linux_arm64.result == 'success' &&
+      needs.desktop_win_x64.result == 'success' && needs.desktop_win_arm64.result == 'success' &&
+      (needs.resolve.outputs.mac != 'true' || (needs.desktop_mac_arm64.result == 'success' && needs.desktop_mac_x64.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
+      RELEASE_NAME: ${{ needs.resolve.outputs.name }}
+      MAC: ${{ needs.resolve.outputs.mac }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/scripts...
+
+      - name: Download all desktop artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Download all CLI archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Write CLI archive checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          shopt -s nullglob
+          archives=(t3-*.tar.gz t3-*.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "No CLI archives were produced." >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      # release.yml's merge requires both macOS manifests; without macOS builds
+      # only the two Windows manifests are merged, the same way.
+      - name: Merge desktop updater manifests
+        run: |
+          set -euo pipefail
+          if [[ "$MAC" == "true" ]]; then
+            node scripts/merge-release-update-manifests.ts release-assets
+            exit 0
+          fi
+          feed="$([[ "$CHANNEL" == nightly ]] && echo nightly || echo latest)"
+          node scripts/merge-update-manifests.ts --platform win \
+            "release-assets/$feed-win-x64.yml" "release-assets/$feed-win-arm64.yml" "release-assets/$feed.yml"
+          rm "release-assets/$feed-win-x64.yml" "release-assets/$feed-win-arm64.yml"
+
+      - name: Check updater manifests
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          manifests=()
+          for file in release-assets/*.yml; do
+            [[ "$file" == */builder-debug.yml ]] && continue
+            manifests+=("$file")
+            version="$(sed -n "s/^version: *['\"]\{0,1\}\([^'\"]*\).*/\1/p" "$file")"
+            if [[ "$version" != "$VERSION" ]]; then
+              echo "::error::$file has version '$version', expected $VERSION."
+              exit 1
+            fi
+          done
+          printf '%s\n' "${manifests[@]}"
+          [[ ${#manifests[@]} -gt 0 ]]
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM_REPOSITORY/releases/tags/$TAG" --jq '.body // ""' > release-notes.md
+          {
+            echo
+            echo "---"
+            echo
+            echo "Built from upstream [$TAG](https://github.com/$UPSTREAM_REPOSITORY/releases/tag/$TAG) with the Kerlov source control provider added. Same version, app ID, and data folders as upstream; updates come from this repository."
+          } >> release-notes.md
+
+      # A draft left by an earlier failed run of this workflow is replaced.
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          existing="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
+          if [[ "$existing" == "false" ]]; then
+            echo "::error::$TAG is already published."
+            exit 1
+          elif [[ "$existing" == "true" ]]; then
+            gh release delete "$TAG" --yes
+          fi
+          shopt -s nullglob
+          files=(release-assets/*.dmg release-assets/*.zip release-assets/*.AppImage release-assets/*.deb
+            release-assets/*.exe release-assets/*.blockmap release-assets/*.tar.gz release-assets/SHA256SUMS)
+          for file in release-assets/*.yml; do
+            [[ "$file" == */builder-debug.yml ]] || files+=("$file")
+          done
+          flags=(--draft --verify-tag --title "$RELEASE_NAME" --notes-file release-notes.md --latest=false)
+          [[ "$CHANNEL" == nightly ]] && flags+=(--prerelease)
+          gh release create "$TAG" "${flags[@]}"
+          gh release upload "$TAG" "${files[@]}"
+          if [[ "$CHANNEL" == nightly ]]; then
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi
+          echo "Published https://github.com/$GH_REPO/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # As release.yml's update_feed: keeps the `update-feed` release's nightly.json
+  # pointing at the newest nightly and fails when releases.atom hides it.
+  update_feed:
+    name: Check the update feed
+    needs: [resolve, publish]
+    if: >-
+      ${{ !cancelled() && needs.resolve.result == 'success' &&
+      (github.event_name == 'schedule' || (needs.publish.result == 'success' && needs.resolve.outputs.channel == 'nightly')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: .github/scripts
+
+      - id: feed
+        name: Read the update feed
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          retries: 3
+          script: |
+            const { readNightlyUpdateFeed } = require('./.github/scripts/check-nightly-release.cjs');
+            const { tag, pointerTag, feedNightly, feedTags } = await readNightlyUpdateFeed({ github, context });
+            if (!tag) return;
+            core.info(`Newest nightly: ${tag}. Pointer: ${pointerTag}. Feed: ${feedTags?.join(', ')}.`);
+            core.setOutput('tag', tag);
+            core.setOutput('pointer_stale', pointerTag !== tag);
+            core.setOutput('feed', feedTags === undefined ? 'unreadable' : feedNightly === tag ? 'ok' : 'hidden');
+
+      - name: Point the update feed at the newest nightly
+        if: steps.feed.outputs.pointer_stale == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.feed.outputs.tag }}
+        run: |
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '{tag_name, name, body}' > nightly.json
+          gh release view update-feed > /dev/null 2>&1 ||
+            gh release create update-feed --prerelease --latest=false --title "Update feed" \
+              --notes "The desktop updater reads this release to find the newest nightly. Do not delete it."
+          gh release upload update-feed nightly.json --clobber
+
+      - name: Keep the update feed release public and never latest
+        if: steps.feed.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit update-feed --draft=false --prerelease --latest=false
+
+      - name: Fail when the feed hides the newest nightly
+        if: steps.feed.outputs.tag != '' && steps.feed.outputs.feed != 'ok'
+        env:
+          RELEASE_TAG: ${{ steps.feed.outputs.tag }}
+          FEED: ${{ steps.feed.outputs.feed }}
+        run: |
+          if [[ "$FEED" == "unreadable" ]]; then
+            echo "::warning::releases.atom could not be read, so this run did not check it."
+            exit 0
+          fi
+          echo "::error::The first nightly in releases.atom is not $RELEASE_TAG. Delete the tags that hide it; only release tags belong in this repository."
+          exit 1
+
+  # Any failure opens (or comments on) an issue naming the tag. While it is
+  # open, scheduled runs skip that tag; close it to retry.
+  report_failure:
+    name: Report failure
+    needs: [resolve, prepare, checks, publish]
+    if: ${{ failure() && needs.resolve.outputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          CONFLICT: ${{ needs.prepare.outputs.conflict }}
+        with:
+          script: |
+            const { TAG, CONFLICT } = process.env;
+            const title = `Kerlov release blocked: ${TAG}`;
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = CONFLICT
+              ? `The patch stack does not apply to upstream \`${TAG}\`.\n\nConflicting commit and files: \`${CONFLICT}\`\n\nRebase the patch branch onto upstream so it applies, then close this issue to retry. Run: ${run}`
+              : `Building upstream \`${TAG}\` with the patch failed. Run: ${run}\n\nClose this issue to let scheduled runs retry it.`;
+            try {
+              const { data } = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`,
+              });
+              const existing = data.items.find((item) => item.title === title);
+              if (existing) {
+                await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+              } else {
+                await github.rest.issues.create({ ...context.repo, title, body });
+              }
+            } catch (error) {
+              core.warning(`Could not open or update the issue (issues may be disabled): ${error.message}`);
+            }

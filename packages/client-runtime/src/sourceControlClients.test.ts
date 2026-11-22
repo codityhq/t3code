@@ -51,6 +51,10 @@ describe("sourceControlClients.parseChangeRequestUrl", () => {
     );
   });
 
+  it("reads a Kerlov /pull/ redirect as Kerlov's, not as GitHub's /pull/", () => {
+    expect(kindOf("https://kerlov.com/acme/web/pull/7")).toBe("kerlov");
+  });
+
   it("reads a Cursor Origin pull request under Origin's git host, not as GitHub's /pull/", () => {
     for (const url of [
       "https://cursor.com/codebase/Acme.Team/Web-App/pull/42",
@@ -292,6 +296,7 @@ describe("sourceControlClients.recognizeRemote", () => {
     expect(kindOfRemote("https://source.tanstack.com/@TanStack/router.git")).toBe(
       "tanstack-source",
     );
+    expect(kindOfRemote("https://git.kerlov.com/acme/web.git")).toBe("kerlov");
   });
 
   it("reads a remote no host claims as an unknown host, and a local path as no host", () => {

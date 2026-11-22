@@ -291,6 +291,14 @@ const INSTALL_HINTS = [
       variable: "SRC_TOKEN",
     },
   ),
+  msg(
+    "Install the Kerlov CLI with {install}, then run {login}, save an API key in Settings, or set {variable} on the server.",
+    {
+      install: "`curl -fsSL https://kerlov.com/install.sh | sh`",
+      login: "`kerlov auth login`",
+      variable: "KERLOV_TOKEN",
+    },
+  ),
 ];
 
 /** @public A source-control `installHint`, translated when it is one of the server's fixed hints. */

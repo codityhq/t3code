@@ -363,7 +363,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
       relay_url: ${{ vars.T3CODE_RELAY_URL }}
       label: macOS arm64
-      runner: macos-15
+      runner: macos-26
       platform: mac
       target: dmg
       arch: arm64
@@ -389,7 +389,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
       relay_url: ${{ vars.T3CODE_RELAY_URL }}
       label: macOS x64
-      runner: macos-15-intel
+      runner: macos-26
       platform: mac
       target: dmg
       arch: x64

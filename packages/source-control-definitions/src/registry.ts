@@ -6,6 +6,7 @@ import * as Forgejo from "@t3tools/source-control-forgejo/shared/definition";
 import * as GitCafe from "@t3tools/source-control-gitcafe/shared/definition";
 import * as GitHub from "@t3tools/source-control-github/shared/definition";
 import * as GitLab from "@t3tools/source-control-gitlab/shared/definition";
+import * as Kerlov from "@t3tools/source-control-kerlov/shared/definition";
 import * as TanStackSource from "@t3tools/source-control-tanstack-source/shared/definition";
 
 export { canonicalizePullRequestUrl as canonicalizeGitCafePullRequestUrl } from "@t3tools/source-control-gitcafe/shared/definition";
@@ -25,6 +26,7 @@ export const builtInSourceControlDefinitions = makeSourceControlDefinitionRegist
     Forgejo.definition,
     Bitbucket.definition,
     AzureDevOps.definition,
+    Kerlov.definition,
   ],
   {
     claimChangeRequestUrlsFirst: [
@@ -32,6 +34,7 @@ export const builtInSourceControlDefinitions = makeSourceControlDefinitionRegist
       TanStackSource.definition.kind,
       CursorOrigin.definition.kind,
       AzureDevOps.definition.kind,
+      Kerlov.definition.kind,
     ],
     recognizeRemotesIn: [
       GitCafe.definition.kind,
@@ -42,6 +45,7 @@ export const builtInSourceControlDefinitions = makeSourceControlDefinitionRegist
       GitLab.definition.kind,
       AzureDevOps.definition.kind,
       Bitbucket.definition.kind,
+      Kerlov.definition.kind,
     ],
   },
 );

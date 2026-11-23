@@ -15,6 +15,10 @@ on:
         description: "Upstream release tag to build (for example v0.1.12-nightly.20261122.5098). Empty picks the next unreleased one."
         required: false
         type: string
+      mac_arm64_runner:
+        description: "Runner label for the macOS arm64 build, for example a one-off self-hosted Mac when GitHub has no arm64 capacity."
+        required: false
+        type: string
 
 run-name: Kerlov release ${{ inputs.tag || '(next upstream tag)' }}
 
@@ -372,8 +376,8 @@ jobs:
       relay_url: ${{ vars.T3CODE_RELAY_URL }}
       label: macOS arm64
       # GitHub's macos-26 Apple silicon pool often has no capacity; macos-15 is a separate pool with Xcode 26.
-      runner: macos-15
-      xcode: "26.3"
+      runner: ${{ inputs.mac_arm64_runner || 'macos-15' }}
+      xcode: ${{ !inputs.mac_arm64_runner && '26.3' || '' }}
       platform: mac
       target: dmg
       arch: arm64

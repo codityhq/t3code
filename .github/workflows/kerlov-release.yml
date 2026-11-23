@@ -207,6 +207,8 @@ jobs:
           mapfile -t commits < <(git rev-list --reverse --no-merges "$base..refs/remotes/origin/patch")
           echo "Patch stack (${#commits[@]} commits on ${base:0:12}):"
           git log --oneline --reverse "$base..refs/remotes/origin/patch"
+          # Upstream keeps adding strings where ours sit; keep both sides, then check the JSON below.
+          echo 'apps/*/src/i18n/translations/*.json merge=union' >> .git/info/attributes
           for commit in "${commits[@]}"; do
             if git cherry-pick "$commit" > /dev/null; then continue; fi
             unmerged="$(git diff --name-only --diff-filter=U)"
@@ -222,6 +224,10 @@ jobs:
             echo "::error::Patch does not apply to $TAG. $summary"
             git cherry-pick --abort
             exit 1
+          done
+          for file in apps/*/src/i18n/translations/*.json; do
+            node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$file" \
+              || { echo "conflict=translations: $file" >> "$GITHUB_OUTPUT"; echo "::error::$file is not valid JSON after applying the patch"; exit 1; }
           done
 
       - name: Setup Vite+

@@ -8,7 +8,7 @@ name: Kerlov release
 
 on:
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "17 */2 * * *"
   workflow_dispatch:
     inputs:
       tag:

@@ -238,6 +238,8 @@ jobs:
       - name: Regenerate the lockfile
         run: |
           set -euo pipefail
+          # Our lockfile lines pin the versions of our branch point; let pnpm add our package to the tag's own.
+          git checkout "refs/upstream-tags/$TAG^{commit}" -- pnpm-lock.yaml
           vp install --lockfile-only --no-frozen-lockfile
           if ! git diff --quiet -- pnpm-lock.yaml; then
             git commit -q -m "chore: update pnpm-lock.yaml for the Kerlov patch on $TAG" -- pnpm-lock.yaml

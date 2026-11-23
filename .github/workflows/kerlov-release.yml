@@ -371,7 +371,9 @@ jobs:
       clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
       relay_url: ${{ vars.T3CODE_RELAY_URL }}
       label: macOS arm64
-      runner: macos-26
+      # GitHub's macos-26 Apple silicon pool often has no capacity; macos-15 is a separate pool with Xcode 26.
+      runner: macos-15
+      xcode: "26.3"
       platform: mac
       target: dmg
       arch: arm64
@@ -397,7 +399,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
       relay_url: ${{ vars.T3CODE_RELAY_URL }}
       label: macOS x64
-      runner: macos-26
+      runner: macos-26-intel
       platform: mac
       target: dmg
       arch: x64

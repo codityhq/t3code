@@ -57,6 +57,11 @@ on:
       resource_key:
         required: true
         type: string
+      # Xcode to select on macOS images whose default is older than the build needs.
+      xcode:
+        required: false
+        type: string
+        default: ""
       # Whether the job also builds the self-contained CLI archive for its own
       # platform/arch, on this runner, and smoke-tests it here. Every archive
       # is built on hardware of its own architecture.
@@ -237,6 +242,13 @@ jobs:
             ~/.cache/electron-builder/fpm@*/fpm-*.7z
             ~/.cache/electron-builder/7zip@*/7zip-linux-*.tar.gz
           key: electron-builder-linux-tools-${{ inputs.arch }}-${{ hashFiles('node_modules/.pnpm/app-builder-lib@*/node_modules/app-builder-lib/out/toolsets/linux.js', 'node_modules/.pnpm/app-builder-lib@*/node_modules/app-builder-lib/out/toolsets/7zip.js') }}
+
+      - name: Select Xcode
+        if: inputs.platform == 'mac' && inputs.xcode != ''
+        shell: bash
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"
+          xcodebuild -version
 
       - name: Ensure Rosetta for macOS x64 bytecode generation
         if: inputs.platform == 'mac' && inputs.arch == 'x64'
